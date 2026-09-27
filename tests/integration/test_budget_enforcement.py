@@ -1393,3 +1393,99 @@ async def test_budgeted_stream_commit_ack_loss_bills_the_delivery_once(
     assert cost > 0
     assert await _get_spent(factory, key_id) == cost
     assert await pending_parked_spend(key_id) == 0
+
+
+async def _blocking_with_usage(budget_env, monkeypatch, *, usage: dict) -> tuple[int, int]:
+    """Drive a blocking request whose model has no price; return (key spend, row cost).
+
+    `_lookup_priced_model` is the single oracle both the cost tier and
+    `_has_known_price` consult, so forcing it to miss makes the response
+    genuinely "usage with no price" — the shape a custom upstream produces —
+    without depending on which models the catalog happens to list today.
+    """
+    from app.routes import chat
+    from sqlalchemy import select
+
+    from packages.db.models.api_key import ApiKey
+    from packages.db.models.request_log import RequestLog
+
+    monkeypatch.setattr(chat, "_lookup_priced_model", lambda model_id: None)
+
+    make_client, fake, factory, _root = budget_env
+    key, key_id = await _make_budgeted_key(factory, budget_limit_cents=10)
+
+    fake.acompletion = AsyncMock(return_value={
+        "id": "chatcmpl-usage-shape",
+        "model": "gpt-4o-mini",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop",
+        }],
+        "usage": usage,
+        "_orca_meta": {
+            "provider": "openai",
+            "litellm_model": "openai/gpt-4o-mini",
+            "latency_ms": 10,
+        },
+    })
+
+    async with await make_client(key) as c:
+        r = await c.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o-mini",
+                  "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert r.status_code == 200, r.text
+
+    async with factory() as s:
+        spent = (
+            await s.execute(select(ApiKey.spent_microcents).where(ApiKey.id == key_id))
+        ).scalar_one()
+        cost = (
+            await s.execute(
+                select(RequestLog.cost_microcents).where(RequestLog.api_key_id == key_id)
+            )
+        ).scalar_one()
+    return spent, cost
+
+
+async def test_budgeted_blocking_empty_usage_is_not_billed_the_cap(budget_env, monkeypatch):
+    """An empty delivery costs nothing, blocking or streaming.
+
+    The blocking fail-closed arm is the streaming path's mirror but lost its token
+    guard, so any 200 with no price charged the key's ENTIRE remaining allowance
+    regardless of usage — a provider that reports zero tokens on an empty prompt,
+    or a custom upstream that leaves the field unset, exhausted a capped key with
+    one request and 429-blocked it for good. A usage frame that carried no tokens
+    is a measured zero; only tokens without a price are an unknown cost.
+    """
+    spent, cost = await _blocking_with_usage(
+        budget_env,
+        monkeypatch,
+        usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    )
+    assert spent == 0
+    assert cost == 0
+
+
+async def test_budgeted_blocking_unpriced_usage_with_tokens_bills_the_cap(
+    budget_env, monkeypatch,
+):
+    """The token guard must not disarm the fail-closed arm standing beside it.
+
+    Same unpriceable model, but the usage carried tokens: the cost is unknown and
+    a budgeted key must not get a delivered completion for free. This is the case
+    the arm exists for, so it is pinned next to the empty-delivery case — together
+    they fix the arm's meaning to exactly the streaming path's.
+    """
+    spent, cost = await _blocking_with_usage(
+        budget_env,
+        monkeypatch,
+        usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    )
+    assert spent == 100_000  # the full remaining allowance (10 cents)
+    assert cost == 100_000  # recorded on the row it charges, not just the counter
+

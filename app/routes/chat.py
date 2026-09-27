@@ -1392,9 +1392,13 @@ async def execute_chat(
         # request history accounts for. Usage with tokens but no price is the
         # same unknown (a custom upstream LiteLLM can't cost, or a model
         # absent from our catalog); a catalog-listed free model is known-zero
-        # and keeps its 0. Gated on having actually received a
-        # completion dict: a request that failed before the upstream answered
-        # (response == {}, e.g. the re-raised HTTPException above, whose
+        # and keeps its 0. As in the streaming arm, the unpriceable branch is
+        # gated on the usage having carried tokens: a usage of {0, 0} is an
+        # empty delivery, whose cost is known to be zero, and charging the whole
+        # remaining allowance for it would let an upstream that reports no tokens
+        # on a 200 permanently exhaust a capped key. Gated on having actually
+        # received a completion dict: a request that failed before the upstream
+        # answered (response == {}, e.g. the re-raised HTTPException above, whose
         # status_code never left 200) charges its recorded ~0 cost instead —
         # mirroring the cache-hit and pre-stream-failure paths.
         if (
@@ -1405,7 +1409,8 @@ async def execute_chat(
             and (
                 not response.get("usage")
                 or (
-                    not (log.cost_microcents or 0)
+                    (log.input_tokens or log.output_tokens)
+                    and not (log.cost_microcents or 0)
                     and not _has_known_price(
                         litellm_cost_usd=(response.get("usage") or {}).get("cost_usd")
                         or (response.get("_orca_meta") or {}).get("cost_usd"),
