@@ -1403,9 +1403,9 @@ async def _blocking_with_usage(budget_env, monkeypatch, *, usage: dict) -> tuple
     genuinely "usage with no price" — the shape a custom upstream produces —
     without depending on which models the catalog happens to list today.
     """
-    from app.routes import chat
     from sqlalchemy import select
 
+    from app.routes import chat
     from packages.db.models.api_key import ApiKey
     from packages.db.models.request_log import RequestLog
 
