@@ -11,7 +11,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from packages.auth import spend
@@ -331,3 +332,145 @@ async def test_second_cancel_during_the_durability_probe_still_decides_the_hold(
     await task
     # No durable row exists, so the probe decided "not durable" and the amount is held.
     assert spend._unsettled.get("k") == {"t": 600}
+
+
+class _CommitFailingSession:
+    """A session whose `commit` fails, simulating a write outage.
+
+    ``land=True`` commits for real and then raises — an acknowledgement loss:
+    the row is durable but the writer cannot know it. Otherwise the commit
+    raises before anything lands.
+    """
+
+    def __init__(self, session, *, land: bool):
+        self._session = session
+        self._land = land
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    async def __aenter__(self):
+        await self._session.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc):
+        return await self._session.__aexit__(*exc)
+
+    async def commit(self):
+        if self._land:
+            await self._session.commit()
+        raise OperationalError("COMMIT", None, Exception("commit failed"))
+
+
+def _commit_failing_factory(maker, *, land: bool):
+    """A session factory whose sessions fail their commit as described above."""
+
+    def factory():
+        return _CommitFailingSession(maker(), land=land)
+
+    return factory
+
+
+async def test_ack_lost_write_is_not_held_when_the_probe_has_to_retry(
+    factory, monkeypatch
+):
+    """A park that landed must never gain a hold on a failed probe.
+
+    Regression for the P1 where the general-failure path probed once and read
+    an unreadable probe as "row absent": the obligation was held on top of its
+    own durable row, another worker folded the row, and this worker's hold
+    re-filed the same obligation and billed it a second time.
+    """
+    await _make_key(factory, key_id="k", spent=0)
+    real_probe = spend._park_is_durable
+    probes = {"n": 0}
+
+    async def unreadable_once(**kw):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            return None  # the database is unreachable at probe time
+        return await real_probe(**kw)
+
+    monkeypatch.setattr(spend, "_park_is_durable", unreadable_once)
+    monkeypatch.setattr(spend, "_PARK_PROBE_RETRY_SECONDS", 0)
+    previous = session_mod._session_factory
+    session_mod._session_factory = _commit_failing_factory(factory, land=True)
+    try:
+        await record_unsettled_spend(trace_id="t", api_key_id="k", microcents=600)
+    finally:
+        session_mod._session_factory = previous
+
+    # The probe was retried instead of being read as "absent", so no hold.
+    assert probes["n"] == 2
+    assert spend._unsettled.get("k") in (None, {})
+    assert await _park_rows(factory, "k") == [("t", 600)]
+
+    # Another worker folds the durable row while this worker holds nothing.
+    async with factory() as s:
+        await s.execute(
+            update(ApiKey).where(ApiKey.id == "k").values(spent_microcents=600)
+        )
+        await s.execute(delete(BudgetPark).where(BudgetPark.trace_id == "t"))
+        await s.commit()
+
+    # Nothing is left to re-file, so the obligation is billed exactly once.
+    assert await settle_parked_spend("k", cap_microcents=10_000) == 0
+    assert await _spent(factory, "k") == 600
+    assert await _park_rows(factory, "k") == []
+
+
+async def test_unlanded_write_with_a_retried_probe_still_holds_the_amount(
+    factory, monkeypatch
+):
+    """A park that never landed is held — but only once the probe says absent."""
+    await _make_key(factory, key_id="k", spent=0)
+    real_probe = spend._park_is_durable
+    probes = {"n": 0}
+
+    async def unreadable_once(**kw):
+        probes["n"] += 1
+        if probes["n"] == 1:
+            return None
+        return await real_probe(**kw)
+
+    monkeypatch.setattr(spend, "_park_is_durable", unreadable_once)
+    monkeypatch.setattr(spend, "_PARK_PROBE_RETRY_SECONDS", 0)
+    previous = session_mod._session_factory
+    session_mod._session_factory = _commit_failing_factory(factory, land=False)
+    try:
+        await record_unsettled_spend(trace_id="t", api_key_id="k", microcents=600)
+    finally:
+        session_mod._session_factory = previous
+
+    assert probes["n"] == 2
+    assert await _park_rows(factory, "k") == []
+    assert spend._unsettled.get("k") == {"t": 600}
+
+
+async def test_second_give_up_after_a_partial_fold_does_not_raise_the_row(factory):
+    """A repeated park write must not resurrect debt the fold already billed.
+
+    Regression for the P1 where the collision path raised the row back to the
+    incoming full amount: after the fold billed part of a parked obligation
+    and trimmed the row to the remainder, a repeated give-up for the same
+    settlement raised the row to the full amount again, double-counting the
+    share already moved into `spent_microcents`.
+    """
+    await _make_key(factory, key_id="k", spent=0)
+    await record_unsettled_spend(trace_id="t", api_key_id="k", microcents=200)
+
+    # Room for 140 of the 200: the fold bills 140 and trims the row to 60.
+    assert await settle_parked_spend("k", cap_microcents=140) == 140
+    assert await _spent(factory, "k") == 140
+    assert await _park_rows(factory, "k") == [("t", 60)]
+
+    # The settlement is retried and gives up again for the same trace.
+    await record_unsettled_spend(trace_id="t", api_key_id="k", microcents=200)
+
+    assert spend._unsettled.get("k") in (None, {})
+    assert await _park_rows(factory, "k") == [("t", 60)]
+
+    # The row is the remaining debt: 140 + 60 = the 200 obligation, once.
+    assert await settle_parked_spend("k", cap_microcents=10_000) == 60
+    assert await _spent(factory, "k") == 200
+    assert await _park_rows(factory, "k") == []

@@ -83,12 +83,22 @@ class _FoldConflict(Exception):
 
 async def _park_is_durable(
     *, trace_id: str, api_key_id: str, expected_microcents: int
-) -> bool:
-    """Whether the durable row covers the entire expected obligation."""
+) -> bool | None:
+    """Whether the durable row covers the entire expected obligation.
+
+    ``None`` means the probe could not read the database at all — a different
+    answer from ``False`` (the row is not there). Callers deciding whether to
+    hold the obligation in memory must never treat an unreadable probe as
+    absence: a hold beside its own durable row lets another worker fold the
+    row and this worker re-file the same obligation later, billing it twice.
+    They retry until this probe answers (`_decide_park_durability`).
+    """
     from packages.db import session as session_mod
 
     factory = session_mod._session_factory
     if factory is None:
+        # No database is configured, so no row can be durable here; the write
+        # path does not even attempt one, which makes "absent" a real answer.
         return False
     try:
         async with factory() as s:
@@ -103,7 +113,34 @@ async def _park_is_durable(
                 and int(amount) >= expected_microcents
             )
     except Exception:
-        return False
+        return None
+
+
+# How long to wait between durability-probe retries while the database is
+# unreadable. The probe is cheap and the caller is already unwinding a failure,
+# so the delay only keeps an outage from spinning the retry loop.
+_PARK_PROBE_RETRY_SECONDS = 0.1
+
+
+async def _decide_park_durability(
+    *, trace_id: str, api_key_id: str, expected_microcents: int
+) -> bool:
+    """Answer whether the row is durable, retrying a probe that cannot read.
+
+    The answer decides whether the obligation is held in memory, and it cannot
+    be guessed: holding a durable obligation double-charges it (the row and the
+    hold), while dropping an absent one loses the spend. So an unreadable probe
+    (``None``) is retried until the database can answer.
+    """
+    while True:
+        durable = await _park_is_durable(
+            trace_id=trace_id,
+            api_key_id=api_key_id,
+            expected_microcents=expected_microcents,
+        )
+        if durable is not None:
+            return durable
+        await asyncio.sleep(_PARK_PROBE_RETRY_SECONDS)
 
 
 async def _insert_park(*, trace_id: str, api_key_id: str, microcents: int) -> bool:
@@ -111,10 +148,11 @@ async def _insert_park(*, trace_id: str, api_key_id: str, microcents: int) -> bo
 
     Idempotent on `trace_id`: a commit that applied but whose ack was lost
     retries into the same primary key instead of recording the obligation a
-    second time. On general failure, `_park_is_durable` is called to probe
-    whether the write landed anyway. Returns False only when the obligation is
-    genuinely not durable, leaving the caller to hold the amount in memory. A
-    cancellation propagates with the memory copy still held.
+    second time. On general failure, `_decide_park_durability` probes whether
+    the write landed anyway, retrying until the database can answer. Returns
+    False only when the obligation is confirmed not durable, leaving the caller
+    to hold the amount in memory. A cancellation propagates with the memory
+    copy still held.
     """
     from packages.db import session as session_mod
 
@@ -132,26 +170,19 @@ async def _insert_park(*, trace_id: str, api_key_id: str, microcents: int) -> bo
                 await s.commit()
             except IntegrityError:
                 # A row for this `trace_id` is already there — our own retried
-                # write after an ack loss, or a concurrent give-up. A hold that
-                # merged further settlements into this one now carries more
-                # than the row does, so raise the row to it rather than
-                # reporting success and dropping the difference. Never lowered:
-                # the larger amount is the one the cap needs.
+                # write after an ack loss, or a repeated give-up for the same
+                # settlement. The row is the authoritative remaining debt for
+                # the trace: the only other writer that lowers it is the fold's
+                # trim, and the difference a trim removes moved into
+                # `spent_microcents` in that transaction. Raising the row back
+                # to `microcents` would add that already-billed difference a
+                # second time; accept the row exactly as it is.
                 await s.rollback()
-                await s.execute(
-                    update(BudgetPark)
-                    .where(
-                        BudgetPark.trace_id == trace_id,
-                        BudgetPark.microcents < microcents,
-                    )
-                    .values(microcents=microcents)
-                )
-                await s.commit()
         return True
     except asyncio.CancelledError:
         raise
     except Exception:
-        return await _park_is_durable(
+        return await _decide_park_durability(
             trace_id=trace_id,
             api_key_id=api_key_id,
             expected_microcents=microcents,
@@ -188,7 +219,7 @@ async def record_unsettled_spend(
         # confirmed. So the loop keeps waiting on the probe task until it
         # finishes, and the cancellation is re-raised afterwards.
         probe = asyncio.ensure_future(
-            _park_is_durable(
+            _decide_park_durability(
                 trace_id=str(trace_id),
                 api_key_id=key,
                 expected_microcents=microcents,
