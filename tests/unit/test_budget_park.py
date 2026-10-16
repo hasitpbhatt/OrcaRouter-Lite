@@ -474,3 +474,93 @@ async def test_second_give_up_after_a_partial_fold_does_not_raise_the_row(factor
     assert await settle_parked_spend("k", cap_microcents=10_000) == 60
     assert await _spent(factory, "k") == 200
     assert await _park_rows(factory, "k") == []
+
+
+async def test_folded_trace_is_never_rebilled_across_workers(factory):
+    """Worker A holds T while worker B folds T's row: no double charge.
+
+    The commit landed but the ack was lost, so A's hold coexists with its
+    durable row. B's fold bills the row and leaves a tombstone; A's next
+    pre-check must drop the stale hold instead of re-filing it.
+    """
+    from packages.db.models.budget_folded import BudgetFolded
+
+    await _make_key(factory, key_id="k", spent=0)
+    async with factory() as s:
+        s.add(BudgetPark(trace_id="T", api_key_id="k", microcents=100))
+        await s.commit()
+    # A's view: the hold survived beside its durable row.
+    spend._hold("k", "T", 100)
+    # B's fold (B never saw the hold): bills 100, deletes the row.
+    holds = spend._unsettled.pop("k")
+    assert await settle_parked_spend("k", cap_microcents=10_000) == 100
+    spend._unsettled["k"] = holds
+    # A's pre-check: the tombstone drops the hold, nothing is re-filed.
+    assert await settle_parked_spend("k", cap_microcents=10_000) == 0
+    assert await _spent(factory, "k") == 100
+    assert await _park_rows(factory, "k") == []
+    assert spend._unsettled.get("k") in (None, {})
+    async with factory() as s:
+        tombstoned = (
+            await s.execute(
+                select(BudgetFolded.trace_id).where(BudgetFolded.api_key_id == "k")
+            )
+        ).scalars().all()
+    assert list(tombstoned) == ["T"]
+
+
+async def test_tombstoned_hold_is_not_counted_in_pending(factory):
+    """A hold whose trace was already folded is spent, not outstanding."""
+    from packages.db.models.budget_folded import BudgetFolded
+
+    await _make_key(factory, key_id="k", spent=100)
+    async with factory() as s:
+        s.add(BudgetFolded(trace_id="T", api_key_id="k", microcents=100))
+        await s.commit()
+    spend._hold("k", "T", 100)
+    assert await pending_parked_spend("k") == 0
+
+
+async def test_stale_refiled_row_is_deleted_unbilled(factory):
+    """A row re-filed after its trace was tombstoned is removed, not billed.
+
+    The race window: A re-inserts T after B's fold tombstoned it but before
+    A's fold reads. The fold must delete the stale row without moving the
+    counter a second time.
+    """
+    from packages.db.models.budget_folded import BudgetFolded
+
+    await _make_key(factory, key_id="k", spent=100)
+    async with factory() as s:
+        s.add(BudgetFolded(trace_id="T", api_key_id="k", microcents=100))
+        s.add(BudgetPark(trace_id="T", api_key_id="k", microcents=100))
+        await s.commit()
+    assert await settle_parked_spend("k", cap_microcents=10_000) == 0
+    assert await _spent(factory, "k") == 100
+    assert await _park_rows(factory, "k") == []
+
+
+async def test_repeated_give_up_after_a_full_fold_is_not_rebilled(factory):
+    """The unique trace key cannot be freed by the fold: re-parking is not re-billing.
+
+    Regression for the P1 where a full bill deleted the park row and left the
+    `trace_id` free: a repeated give-up for the same settlement re-inserted the
+    full amount, and the next fold — finding no request-log row for a charge
+    that never landed — billed the same obligation a second time.
+    """
+    await _make_key(factory, key_id="k", spent=0)
+    await record_unsettled_spend(trace_id="t", api_key_id="k", microcents=100)
+    assert await settle_parked_spend("k", cap_microcents=10_000) == 100
+    assert await _spent(factory, "k") == 100
+    assert await _park_rows(factory, "k") == []
+
+    # The settlement is retried and gives up again for the same trace: the
+    # write lands, because the fold freed the unique key when it deleted the
+    # row. It must not read as outstanding debt.
+    await record_unsettled_spend(trace_id="t", api_key_id="k", microcents=100)
+    assert await pending_parked_spend("k") == 0
+
+    # The next fold deletes the stale re-file unbilled: one obligation, one bill.
+    assert await settle_parked_spend("k", cap_microcents=10_000) == 0
+    assert await _spent(factory, "k") == 100
+    assert await _park_rows(factory, "k") == []
